@@ -1,0 +1,23 @@
+# Requirements.txt optimizado para Windows
+# Versiones más recientes y compatibles
+
+# Librerías principales
+opencv-python>=4.8.0
+ultralytics>=8.0.200
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# Análisis y visualización
+matplotlib>=3.7.0
+seaborn>=0.12.0
+pandas>=2.0.0
+
+# Dependencias adicionales para evitar conflictos
+setuptools>=68.0.0
+wheel>=0.40.0
+packaging>=23.0
+
+# Para evitar problemas de compilación en Windows
+--only-binary=all

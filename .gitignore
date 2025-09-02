@@ -1,0 +1,17 @@
+food_detection_env/
+food_detection/
+__pycache__/
+*.pyc
+*.pyo
+
+food_data/
+screenshots/
+*.log
+vscode/
+.DS_Store
+.env
+.idea/
+*.sqlite3
+*.db
+*.egg-info/
+    
