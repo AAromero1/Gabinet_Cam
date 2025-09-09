@@ -213,7 +213,7 @@ class GoogleSheetsManager:
         except Exception as e:
             logger.error(f"❌ Error formateando encabezados de hoja específica: {e}")
     
-    def log_detection(self, item_name, confidence, additional_info=None):
+    def log_detection(self, item_name, confidence, quantity=1, additional_info=None):
         """
         Registrar detección usando la estructura existente sin modificarla
         """
@@ -246,7 +246,7 @@ class GoogleSheetsManager:
                     nueva_fila.append(f"{confidence:.3f}")
                 elif 'quantity' in header_lower or 'cantidad' in header_lower:
                     # quantity/cantidad
-                    nueva_fila.append("1")
+                    nueva_fila.append(str(quantity))
                 elif 'source' in header_lower or 'origen' in header_lower:
                     # source/origen
                     nueva_fila.append("camera")
@@ -467,3 +467,75 @@ class GoogleSheetsManager:
         except Exception as e:
             logger.error(f"❌ Error obteniendo último item ID: {e}")
             return None
+    
+    def update_item_quantity(self, item_id, new_quantity, additional_info=None):
+        """
+        Actualizar la cantidad de un item existente por su ID
+        """
+        if not self.sheet or not self.main_headers:
+            logger.error("❌ No hay hoja principal disponible")
+            return False
+        
+        try:
+            # Obtener todos los datos
+            all_data = self.sheet.get_all_values()
+            if not all_data:
+                logger.error("❌ No hay datos en la hoja")
+                return False
+            
+            headers = all_data[0]
+            
+            # Encontrar índices de columnas importantes
+            item_id_col = None
+            quantity_col = None
+            updated_col = None
+            
+            for i, header in enumerate(headers):
+                header_lower = header.lower()
+                if 'id' in header_lower and 'item' in header_lower:
+                    item_id_col = i
+                elif 'quantity' in header_lower or 'cantidad' in header_lower:
+                    quantity_col = i
+                elif 'updated' in header_lower or 'actualizado' in header_lower:
+                    updated_col = i
+            
+            if item_id_col is None:
+                logger.error("❌ No se encontró columna de item_id")
+                return False
+            
+            # Buscar la fila con el item_id
+            row_to_update = None
+            for i, row in enumerate(all_data[1:], start=2):  # start=2 porque enumerate empieza en 0 pero las filas de gsheets empiezan en 1
+                if len(row) > item_id_col and row[item_id_col] == item_id:
+                    row_to_update = i
+                    break
+            
+            if row_to_update is None:
+                logger.error(f"❌ No se encontró item con ID: {item_id}")
+                return False
+            
+            # Actualizar cantidad
+            if quantity_col is not None:
+                self.sheet.update_cell(row_to_update, quantity_col + 1, str(new_quantity))
+                logger.info(f"✅ Cantidad actualizada para {item_id}: {new_quantity}")
+            
+            # Actualizar timestamp de modificación si existe la columna
+            if updated_col is not None:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self.sheet.update_cell(row_to_update, updated_col + 1, timestamp)
+            
+            # Si hay información adicional y columna para notas
+            if additional_info:
+                for i, header in enumerate(headers):
+                    if 'note' in header.lower() or 'nota' in header.lower() or 'info' in header.lower():
+                        current_info = all_data[row_to_update - 1][i] if len(all_data[row_to_update - 1]) > i else ""
+                        new_info = f"{current_info}; {additional_info}" if current_info else additional_info
+                        self.sheet.update_cell(row_to_update, i + 1, new_info)
+                        break
+            
+            time.sleep(1)  # Pausa para evitar rate limiting
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Error actualizando cantidad del item {item_id}: {e}")
+            return False

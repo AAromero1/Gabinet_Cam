@@ -3,6 +3,7 @@ import torch
 from ultralytics import YOLO
 import numpy as np
 import time
+import os
 from typing import List, Dict, Tuple
 import logging
 from google_sheets_integration import GoogleSheetsManager
@@ -16,16 +17,22 @@ class EnhancedFoodObjectDetector:
     Detector mejorado que incluye alimentos y objetos relacionados como botellas, latas, etc.
     """
     
-    def __init__(self, model_path: str = "yolov8n.pt", confidence_threshold: float = 0.4):
+    def __init__(self, model_path: str = "yolov8n.pt", confidence_threshold: float = 0.4, 
+                 video_source=None, output_video_path: str = None):
         """
         Inicializar el detector mejorado
         
         Args:
             model_path: Ruta al modelo YOLO
             confidence_threshold: Umbral de confianza (más bajo para detectar más objetos)
+            video_source: Ruta del video de entrada (None para cámara)
+            output_video_path: Ruta del video de salida con detecciones
         """
         self.confidence_threshold = confidence_threshold
         self.model = None
+        self.video_source = video_source
+        self.output_video_path = output_video_path
+        self.video_writer = None
         
         # Definir todas las clases relevantes del dataset COCO
         self.target_classes = self._get_target_classes()
@@ -92,7 +99,7 @@ class EnhancedFoodObjectDetector:
             # === SNACKS Y PAQUETES ===
             # Note: COCO no tiene clases específicas para bolsas de snacks o cajas de jugo
             # Pero podemos detectar objetos similares
-            67: {'name': 'cell_phone', 'category': 'contexto', 'priority': 'low'},  # contexto de snacking
+            67: {'name': 'cell_phone', 'category': 'contexto', 'priority': 'low'},  
             73: {'name': 'laptop', 'category': 'contexto', 'priority': 'low'},      # contexto de comida en escritorio
             76: {'name': 'keyboard', 'category': 'contexto', 'priority': 'low'},    # contexto de snacking
             84: {'name': 'book', 'category': 'contexto', 'priority': 'low'},        # contexto de snacking mientras estudia
@@ -126,25 +133,47 @@ class EnhancedFoodObjectDetector:
         }
         return category_colors
     
-    def initialize_camera(self, camera_index: int = 0) -> bool:
-        """Inicializar la cámara"""
+    def initialize_video_source(self) -> bool:
+        """Inicializar fuente de video (cámara o archivo)"""
         try:
-            self.cap = cv2.VideoCapture(camera_index)
-            
-            # Configurar propiedades
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-            self.cap.set(cv2.CAP_PROP_FPS, 30)
+            if self.video_source is None:
+                # Usar cámara
+                self.cap = cv2.VideoCapture(0)
+                logger.info("Usando cámara web como fuente de video")
+            else:
+                # Usar archivo de video
+                self.cap = cv2.VideoCapture(self.video_source)
+                logger.info(f"Usando archivo de video: {self.video_source}")
             
             if not self.cap.isOpened():
-                logger.error("No se pudo abrir la cámara")
+                logger.error("No se pudo abrir la fuente de video")
                 return False
-                
-            logger.info("Cámara inicializada correctamente")
+            
+            # Obtener propiedades del video
+            self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+            self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            
+            logger.info(f"Video: {self.frame_width}x{self.frame_height} @ {self.fps} FPS")
+            if self.video_source:
+                logger.info(f"Total frames: {self.total_frames}")
+            
+            # Configurar video writer si se especifica salida
+            if self.output_video_path:
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                self.video_writer = cv2.VideoWriter(
+                    self.output_video_path, 
+                    fourcc, 
+                    self.fps if self.fps > 0 else 30.0, 
+                    (self.frame_width, self.frame_height)
+                )
+                logger.info(f"Video de salida configurado: {self.output_video_path}")
+            
             return True
             
         except Exception as e:
-            logger.error(f"Error al inicializar la cámara: {e}")
+            logger.error(f"Error al inicializar fuente de video: {e}")
             return False
     
     def detect_objects(self, frame: np.ndarray) -> Tuple[np.ndarray, List[Dict]]:
@@ -254,67 +283,82 @@ class EnhancedFoodObjectDetector:
         return detection
     
     def _generate_object_key(self, detection: Dict) -> str:
-        """Generar clave única para un objeto basada en su clase y posición aproximada"""
+        """Generar clave única para un objeto basada en su clase y categoría"""
         class_name = detection['class_name']
-        x1, y1, x2, y2 = detection['bbox']
+        category = detection['category']
         
-        # Calcular centro y crear región de 100x100 píxeles para agrupamiento
-        center_x = (x1 + x2) // 2
-        center_y = (y1 + y2) // 2
-        region_x = center_x // 100
-        region_y = center_y // 100
-        
-        return f"{class_name}_{region_x}_{region_y}"
+        # Para objetos del mismo tipo, usar solo el nombre de clase y categoría
+        # Esto permitirá agrupar todos los objetos similares bajo una sola entrada
+        return f"{category}_{class_name}"
     
     def _update_tracked_objects(self, detections: List[Dict]):
         """Actualizar el sistema de tracking de objetos"""
         self._frame_counter += 1
-        current_frame_objects = set()
+        current_frame_objects = {}
         
-        # Procesar detecciones actuales
+        # Contar objetos por tipo en el frame actual
         for detection in detections:
             if detection['priority'] in ['high', 'medium']:  # Solo productos importantes
                 object_key = self._generate_object_key(detection)
-                current_frame_objects.add(object_key)
-                
-                if object_key in self._tracked_objects:
-                    # Objeto ya existe - actualizar información
-                    obj_info = self._tracked_objects[object_key]
-                    obj_info['last_seen_frame'] = self._frame_counter
-                    obj_info['total_detections'] += 1
-                    obj_info['confidence_sum'] += detection['confidence']
-                    obj_info['avg_confidence'] = obj_info['confidence_sum'] / obj_info['total_detections']
-                    
-                    # Verificar si ha cambiado la cantidad (múltiples instancias)
-                    current_instances = len([d for d in detections if self._generate_object_key(d) == object_key])
-                    if current_instances > obj_info['quantity']:
-                        # Aumentó la cantidad - registrar nuevas instancias
-                        new_instances = current_instances - obj_info['quantity']
-                        obj_info['quantity'] = current_instances
-                        self._register_additional_instances(detection, new_instances, obj_info)
-                        
-                else:
-                    # Nuevo objeto - inicializar tracking
-                    self._tracked_objects[object_key] = {
+                if object_key not in current_frame_objects:
+                    current_frame_objects[object_key] = {
                         'detection': detection,
-                        'first_seen_frame': self._frame_counter,
-                        'last_seen_frame': self._frame_counter,
-                        'total_detections': 1,
-                        'confidence_sum': detection['confidence'],
-                        'avg_confidence': detection['confidence'],
-                        'quantity': 1,
-                        'registered': False,
-                        'item_ids': []  # IDs de items registrados en sheets
+                        'count': 1
                     }
+                else:
+                    current_frame_objects[object_key]['count'] += 1
         
-        # Verificar objetos que han desaparecido
-        self._check_disappeared_objects(current_frame_objects)
+        # Procesar objetos detectados
+        for object_key, frame_data in current_frame_objects.items():
+            detection = frame_data['detection']
+            current_count = frame_data['count']
+            
+            if object_key in self._tracked_objects:
+                # Objeto ya existe - actualizar información
+                obj_info = self._tracked_objects[object_key]
+                obj_info['last_seen_frame'] = self._frame_counter
+                obj_info['total_detections'] += 1
+                obj_info['confidence_sum'] += detection['confidence']
+                obj_info['avg_confidence'] = obj_info['confidence_sum'] / obj_info['total_detections']
+                
+                # Verificar si ha cambiado la cantidad
+                if current_count > obj_info['quantity']:
+                    # Aumentó la cantidad - registrar nuevas instancias
+                    new_instances = current_count - obj_info['quantity']
+                    obj_info['quantity'] = current_count
+                    self._register_additional_instances(detection, new_instances, obj_info)
+                    logger.info(f"📈 Cantidad aumentada: {detection['class_name']} "
+                              f"de {obj_info['quantity'] - new_instances} a {obj_info['quantity']}")
+                elif current_count < obj_info['quantity']:
+                    # Disminuyó la cantidad - actualizar pero no eliminar aún
+                    obj_info['quantity'] = current_count
+                    logger.info(f"📉 Cantidad disminuida: {detection['class_name']} "
+                              f"a {obj_info['quantity']}")
+                    
+            else:
+                # Nuevo objeto - inicializar tracking
+                self._tracked_objects[object_key] = {
+                    'detection': detection,
+                    'first_seen_frame': self._frame_counter,
+                    'last_seen_frame': self._frame_counter,
+                    'total_detections': 1,
+                    'confidence_sum': detection['confidence'],
+                    'avg_confidence': detection['confidence'],
+                    'quantity': current_count,
+                    'registered': False,
+                    'item_id': None  # Un solo ID para todo el grupo
+                }
+                logger.info(f"🆕 Nuevo objeto tracked: {detection['class_name']} "
+                          f"(cantidad inicial: {current_count})")
+        
+        # Verificar objetos que han desaparecido completamente
+        self._check_disappeared_objects(set(current_frame_objects.keys()))
         
         # Registrar objetos que han sido confirmados
         self._register_confirmed_objects()
     
     def _register_additional_instances(self, detection: Dict, new_instances: int, obj_info: Dict):
-        """Registrar instancias adicionales de un objeto cuando aumenta la cantidad"""
+        """Actualizar cantidad de un objeto existente en lugar de crear nuevos registros"""
         if not self.sheets_manager.is_connected:
             return
         
@@ -322,26 +366,41 @@ class EnhancedFoodObjectDetector:
             item_name = detection['class_name']
             confidence = obj_info['avg_confidence']
             
-            logger.info(f"📈 Cantidad aumentada: {item_name} (+{new_instances} unidades)")
-            
-            for i in range(new_instances):
+            # Si ya hay un item_id registrado, actualizar la cantidad
+            if obj_info['item_id']:
+                logger.info(f"📈 Actualizando cantidad: {item_name} (+{new_instances} unidades)")
+                
+                # Actualizar en el inventario usando el ID existente
+                success = self.sheets_manager.update_item_quantity(
+                    item_id=obj_info['item_id'],
+                    new_quantity=obj_info['quantity'],
+                    additional_info=f"Cantidad actualizada automáticamente - Frame: {self._frame_counter}"
+                )
+                
+                if success:
+                    video_info = f" (VIDEO: {os.path.basename(self.video_source)})" if self.video_source else ""
+                    logger.info(f"✅ Cantidad actualizada en Excel{video_info}: {item_name} ahora tiene {obj_info['quantity']} unidades (ID: {obj_info['item_id']})")
+                else:
+                    logger.warning(f"⚠️ No se pudo actualizar cantidad en inventario: {item_name}")
+            else:
+                # Si no hay ID aún, registrar por primera vez con la cantidad total
                 success = self.sheets_manager.log_detection(
                     item_name=item_name,
                     confidence=confidence,
-                    additional_info=f"Instancia adicional detectada - Frame: {self._frame_counter}"
+                    quantity=obj_info['quantity'],
+                    additional_info=f"Primera detección con cantidad {obj_info['quantity']} - Frame: {self._frame_counter}"
                 )
                 
                 if success:
                     last_item_id = self.sheets_manager.get_last_item_id()
                     if last_item_id:
-                        obj_info['item_ids'].append(last_item_id)
+                        obj_info['item_id'] = last_item_id
                         self._add_automatic_synonyms(item_name, last_item_id, detection['category'])
-                        logger.info(f"✅ Instancia adicional registrada: {item_name} (ID: {last_item_id})")
-                
-                time.sleep(0.3)  # Pausa entre registros
+                        video_info = f" (VIDEO: {os.path.basename(self.video_source)})" if self.video_source else ""
+                        logger.info(f"✅ Nuevo objeto registrado en Excel{video_info}: {item_name} con {obj_info['quantity']} unidades (ID: {last_item_id})")
                 
         except Exception as e:
-            logger.error(f"❌ Error registrando instancias adicionales: {e}")
+            logger.error(f"❌ Error actualizando cantidad: {e}")
     
     def _check_disappeared_objects(self, current_frame_objects: set):
         """Verificar y eliminar objetos que han desaparecido"""
@@ -353,12 +412,12 @@ class EnhancedFoodObjectDetector:
                 
                 if frames_missing >= self._disappearance_threshold:
                     # Objeto ha desaparecido - eliminar del inventario si estaba registrado
-                    if obj_info['registered'] and obj_info['item_ids']:
+                    if obj_info['registered'] and obj_info['item_id']:
                         self._remove_disappeared_object(obj_info)
                     
                     disappeared_objects.append(object_key)
                     logger.info(f"🗑️ Objeto desaparecido: {obj_info['detection']['class_name']} "
-                              f"(ausente por {frames_missing} frames)")
+                              f"(ausente por {frames_missing} frames, cantidad: {obj_info['quantity']})")
         
         # Eliminar objetos desaparecidos del tracking
         for object_key in disappeared_objects:
@@ -371,9 +430,9 @@ class EnhancedFoodObjectDetector:
         
         try:
             item_name = obj_info['detection']['class_name']
+            item_id = obj_info['item_id']
             
-            # Eliminar todos los IDs registrados para este objeto
-            for item_id in obj_info['item_ids']:
+            if item_id:
                 # Registrar eliminación en bitácora
                 self.sheets_manager.log_removal_to_bitacora(
                     item_id=item_id,
@@ -387,9 +446,10 @@ class EnhancedFoodObjectDetector:
                     reason="objeto_desaparecido_de_camara"
                 )
                 
-                time.sleep(0.2)
-            
-            logger.info(f"🗑️ Objeto eliminado del inventario: {item_name} ({len(obj_info['item_ids'])} unidades)")
+                logger.info(f"🗑️ Objeto eliminado del inventario: {item_name} "
+                          f"({obj_info['quantity']} unidades, ID: {item_id})")
+            else:
+                logger.info(f"🗑️ Objeto desaparecido sin ID registrado: {item_name}")
             
         except Exception as e:
             logger.error(f"❌ Error eliminando objeto desaparecido: {e}")
@@ -403,7 +463,8 @@ class EnhancedFoodObjectDetector:
                 # Objeto confirmado - registrar en inventario
                 if self._register_confirmed_object(obj_info):
                     obj_info['registered'] = True
-                    logger.info(f"✅ Objeto confirmado y registrado: {obj_info['detection']['class_name']} "
+                    video_info = f" (VIDEO: {os.path.basename(self.video_source)})" if self.video_source else ""
+                    logger.info(f"✅ Objeto confirmado y registrado en Excel{video_info}: {obj_info['detection']['class_name']} "
                               f"(confianza promedio: {obj_info['avg_confidence']:.3f})")
     
     def _register_confirmed_object(self, obj_info: Dict) -> bool:
@@ -415,21 +476,26 @@ class EnhancedFoodObjectDetector:
             detection = obj_info['detection']
             item_name = detection['class_name']
             confidence = obj_info['avg_confidence']
+            quantity = obj_info['quantity']
             
             additional_info = (f"Objeto confirmado después de {obj_info['total_detections']} detecciones. "
-                             f"Frames: {obj_info['first_seen_frame']}-{obj_info['last_seen_frame']}")
+                             f"Frames: {obj_info['first_seen_frame']}-{obj_info['last_seen_frame']}. "
+                             f"Cantidad: {quantity}")
             
             success = self.sheets_manager.log_detection(
                 item_name=item_name,
                 confidence=confidence,
+                quantity=quantity,
                 additional_info=additional_info
             )
             
             if success:
                 last_item_id = self.sheets_manager.get_last_item_id()
                 if last_item_id:
-                    obj_info['item_ids'].append(last_item_id)
+                    obj_info['item_id'] = last_item_id
                     self._add_automatic_synonyms(item_name, last_item_id, detection['category'])
+                    video_info = f" (VIDEO: {os.path.basename(self.video_source)})" if self.video_source else ""
+                    logger.info(f"📦 Item registrado exitosamente en Excel{video_info}: {item_name} (ID: {last_item_id})")
                     return True
             
         except Exception as e:
@@ -504,7 +570,7 @@ class EnhancedFoodObjectDetector:
             
             elif 'lata' in item_lower or 'bottle' in item_lower:
                 synonyms_to_add.extend([
-                    ('bebida', item_id, 'Bebidas'),
+                    ('Jugo', item_id, 'Bebidas'),
                     ('lata', item_id, 'Bebidas'),
                     ('refresco', item_id, 'Bebidas')
                 ])
@@ -628,28 +694,54 @@ class EnhancedFoodObjectDetector:
         return frame
     
     def run_enhanced_detection(self):
-        """Ejecutar detección mejorada en tiempo real"""
-        if not self.initialize_camera():
+        """Ejecutar detección mejorada en tiempo real o en video"""
+        if not self.initialize_video_source():
             return
         
-        logger.info("Iniciando detección mejorada en tiempo real...")
+        source_type = "video" if self.video_source else "cámara"
+        logger.info(f"Iniciando detección mejorada en {source_type}...")
         logger.info("Detectando: alimentos, bebidas, latas, contenedores, galletas y objetos relacionados")
         logger.info("🎯 Sistema de tracking inteligente: reduce falsos positivos")
         logger.info("📦 Inventario automático: registrando productos importantes")
-        logger.info("Presiona 'q' para salir, 's' para screenshot, 'c' para estadísticas")
-        logger.info("Presiona 'i' para estado inventario, 'r' para forzar registro, 't' para tracking")
+        
+        # Verificar estado de Google Sheets para videos
+        if self.video_source:
+            sheets_status = "✅ ACTIVO" if self.sheets_manager.is_connected else "❌ DESCONECTADO"
+            logger.info(f"📊 Google Sheets para videos: {sheets_status}")
+            if self.sheets_manager.is_connected:
+                logger.info("🎬 Los elementos detectados en el video SÍ se agregarán al Excel/Google Sheets")
+            else:
+                logger.warning("⚠️ Los elementos detectados en el video NO se agregarán al Excel (falta conexión)")
+        else:
+            sheets_status = "✅ ACTIVO" if self.sheets_manager.is_connected else "❌ DESCONECTADO"
+            logger.info(f"📊 Google Sheets para cámara: {sheets_status}")
+        
+        if self.video_source:
+            logger.info(f"Procesando video: {self.video_source}")
+            logger.info(f"Total frames a procesar: {self.total_frames}")
+            if self.output_video_path:
+                logger.info(f"Guardando resultado en: {self.output_video_path}")
+        else:
+            logger.info("Presiona 'q' para salir, 's' para screenshot, 'c' para estadísticas")
+            logger.info("Presiona 'i' para estado inventario, 'r' para forzar registro, 't' para tracking")
         
         fps_counter = 0
         start_time = time.time()
         detection_stats = {'total': 0, 'by_category': {}}
+        processed_frames = 0
         
         try:
             while True:
                 ret, frame = self.cap.read()
                 
                 if not ret:
-                    logger.error("No se pudo leer el frame de la cámara")
+                    if self.video_source:
+                        logger.info("Procesamiento de video completado")
+                    else:
+                        logger.error("No se pudo leer el frame de la cámara")
                     break
+                
+                processed_frames += 1
                 
                 # Detectar objetos
                 processed_frame, detections = self.detect_objects(frame)
@@ -657,13 +749,18 @@ class EnhancedFoodObjectDetector:
                 # Actualizar estadísticas
                 self._update_stats(detections, detection_stats)
                 
-                # Calcular FPS
+                # Calcular FPS y progreso
                 fps_counter += 1
                 if fps_counter % 30 == 0:
                     end_time = time.time()
                     fps = 30 / (end_time - start_time)
                     start_time = end_time
-                    logger.info(f"FPS: {fps:.2f}")
+                    
+                    if self.video_source:
+                        progress = (processed_frames / self.total_frames) * 100
+                        logger.info(f"Progreso: {processed_frames}/{self.total_frames} ({progress:.1f}%) - FPS: {fps:.2f}")
+                    else:
+                        logger.info(f"FPS: {fps:.2f}")
                 
                 # Añadir información al frame
                 self._add_enhanced_info(processed_frame, detections, fps_counter, detection_stats)
@@ -671,29 +768,50 @@ class EnhancedFoodObjectDetector:
                 # Añadir información de tracking
                 processed_frame = self._draw_tracking_info(processed_frame)
                 
-                # Mostrar frame
-                cv2.imshow('Detector Mejorado - Alimentos y Objetos', processed_frame)
+                # Añadir información de progreso para videos
+                if self.video_source:
+                    progress = (processed_frames / self.total_frames) * 100
+                    progress_text = f"Progreso: {processed_frames}/{self.total_frames} ({progress:.1f}%)"
+                    cv2.putText(processed_frame, progress_text, (10, self.frame_height - 50), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 
-                # Manejar teclas
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    break
-                elif key == ord('s'):
-                    self._save_enhanced_screenshot(processed_frame, detections)
-                elif key == ord('c'):
-                    self._print_stats(detection_stats)
-                elif key == ord('i'):
-                    self._print_inventory_status()
-                elif key == ord('r'):
-                    self._force_register_current_detections(detections)
-                elif key == ord('t'):
-                    self._print_tracking_stats()
+                # Guardar frame en video de salida si está configurado
+                if self.video_writer:
+                    self.video_writer.write(processed_frame)
+                
+                # Mostrar frame (opcional para videos)
+                if not self.video_source or self.video_source and processed_frames % 5 == 0:  # Mostrar cada 5 frames para videos
+                    cv2.imshow('Detector Mejorado - Alimentos y Objetos', processed_frame)
+                
+                # Manejar teclas (solo para cámara o video con visualización)
+                if not self.video_source:
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
+                        break
+                    elif key == ord('s'):
+                        self._save_enhanced_screenshot(processed_frame, detections)
+                    elif key == ord('c'):
+                        self._print_stats(detection_stats)
+                    elif key == ord('i'):
+                        self._print_inventory_status()
+                    elif key == ord('r'):
+                        self._force_register_current_detections(detections)
+                    elif key == ord('t'):
+                        self._print_tracking_stats()
+                else:
+                    # Para videos, verificar si se presiona 'q' para cancelar
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
+                        logger.info("Procesamiento cancelado por el usuario")
+                        break
                     
         except KeyboardInterrupt:
             logger.info("Detección interrumpida por el usuario")
         except Exception as e:
             logger.error(f"Error durante la detección: {e}")
         finally:
+            # Mostrar estadísticas finales
+            self._print_final_stats(detection_stats, processed_frames)
             self.cleanup()
     
     def _update_stats(self, detections: List[Dict], stats: Dict):
@@ -904,13 +1022,37 @@ class EnhancedFoodObjectDetector:
                 print(f"    - Último visto: hace {frames_since_seen} frames")
                 print(f"    - Detecciones totales: {obj_info['total_detections']}")
                 print(f"    - Confianza promedio: {obj_info['avg_confidence']:.3f}")
-                if obj_info['item_ids']:
-                    print(f"    - IDs en inventario: {obj_info['item_ids']}")
+                if obj_info['item_id']:
+                    print(f"    - ID en inventario: {obj_info['item_id']}")
                 print("")
         else:
             print("🚫 No hay objetos siendo tracked actualmente")
         
         print("=" * 60)
+    
+    def _print_final_stats(self, stats: Dict, total_frames: int):
+        """Imprimir estadísticas finales del procesamiento"""
+        logger.info("=" * 60)
+        logger.info("📊 ESTADÍSTICAS FINALES")
+        logger.info("=" * 60)
+        logger.info(f"Frames procesados: {total_frames}")
+        logger.info(f"Total objetos detectados: {stats['total']}")
+        logger.info(f"Promedio detecciones por frame: {stats['total']/total_frames:.2f}" if total_frames > 0 else "N/A")
+        
+        if stats['by_category']:
+            logger.info("\n📋 Por categoría:")
+            for category, count in stats['by_category'].items():
+                percentage = (count / stats['total']) * 100 if stats['total'] > 0 else 0
+                logger.info(f"  • {category}: {count} ({percentage:.1f}%)")
+        
+        logger.info(f"\n🎯 Objetos tracked finales: {len(self._tracked_objects)}")
+        registered_objects = sum(1 for obj in self._tracked_objects.values() if obj['registered'])
+        logger.info(f"📦 Objetos registrados en inventario: {registered_objects}")
+        
+        if self.output_video_path:
+            logger.info(f"\n🎬 Video guardado: {self.output_video_path}")
+        
+        logger.info("=" * 60)
     
     def cleanup(self):
         """Limpiar recursos"""
@@ -923,19 +1065,73 @@ class EnhancedFoodObjectDetector:
         """Limpiar recursos"""
         if hasattr(self, 'cap') and self.cap:
             self.cap.release()
+        if hasattr(self, 'video_writer') and self.video_writer:
+            self.video_writer.release()
+            logger.info("Video de salida guardado correctamente")
         cv2.destroyAllWindows()
         logger.info("Recursos liberados")
 
 def main():
     """Función principal del detector mejorado"""
+    import argparse
+    
+    # Configurar argumentos de línea de comandos
+    parser = argparse.ArgumentParser(description='Detector Mejorado de Alimentos y Objetos')
+    parser.add_argument('--video', '-v', type=str, help='Ruta del video de entrada')
+    parser.add_argument('--output', '-o', type=str, help='Ruta del video de salida con detecciones')
+    parser.add_argument('--confidence', '-c', type=float, default=0.4, help='Umbral de confianza (default: 0.4)')
+    parser.add_argument('--model', '-m', type=str, default='yolov8n.pt', help='Ruta del modelo YOLO (default: yolov8n.pt)')
+    
+    args = parser.parse_args()
+    
     try:
         print("🍎🥤🍪 Detector Mejorado de Alimentos y Objetos con Inventario Automático")
         print("Detecta: alimentos, bebidas, latas, galletas, contenedores, utensilios y contexto")
         print("📦 Inventario automático: registra productos importantes en Google Sheets")
         print("🔗 Sinónimos automáticos: crea términos de búsqueda para cada producto")
+        print("🎯 Sistema de tracking inteligente: reduce falsos positivos")
         print("=" * 80)
         
-        # Crear detector con umbral más bajo para detectar más objetos
+        # Determinar nombres de archivo automáticamente si no se especifican
+        if args.video and not args.output:
+            import os
+            video_name = os.path.splitext(os.path.basename(args.video))[0]
+            args.output = f"{video_name}_detected.mp4"
+            print(f"📁 Video de salida automático: {args.output}")
+        
+        # Crear detector
+        detector = EnhancedFoodObjectDetector(
+            model_path=args.model,
+            confidence_threshold=args.confidence,
+            video_source=args.video,
+            output_video_path=args.output
+        )
+        
+        # Mostrar configuración
+        if args.video:
+            print(f"📹 Procesando video: {args.video}")
+            if args.output:
+                print(f"💾 Guardando resultado en: {args.output}")
+        else:
+            print("📸 Usando cámara web en tiempo real")
+        
+        print(f"🤖 Modelo: {args.model}")
+        print(f"🎯 Umbral de confianza: {args.confidence}")
+        print("=" * 80)
+        
+        # Ejecutar detección
+        detector.run_enhanced_detection()
+        
+    except Exception as e:
+        logger.error(f"Error en la aplicación principal: {e}")
+
+def main_simple():
+    """Función principal simple para compatibilidad"""
+    try:
+        print("🍎🥤🍪 Detector Mejorado de Alimentos y Objetos (Modo Simple)")
+        print("Usando configuración por defecto...")
+        
+        # Crear detector con configuración por defecto
         detector = EnhancedFoodObjectDetector(
             model_path="yolov8n.pt",
             confidence_threshold=0.4
