@@ -14,4 +14,4 @@ vscode/
 *.sqlite3
 *.db
 *.egg-info/
-    
+calm-segment*.json
