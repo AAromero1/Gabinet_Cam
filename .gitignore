@@ -14,4 +14,8 @@ vscode/
 *.sqlite3
 *.db
 *.egg-info/
+
+# Google Cloud credentials
 calm-segment*.json
+*-credentials.json
+service-account*.json
