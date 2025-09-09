@@ -1,0 +1,11 @@
+=== DETECCIÓN MEJORADA ===
+Archivo: enhanced_detection_1756831785.jpg
+Timestamp: Tue Sep  2 12:49:45 2025
+Total objetos: 2
+
+=== BEBIDA_CONTENEDOR (2 objetos) ===
+- bottle: 0.825 (prioridad: medium)
+  Bbox: (655, 271, 800, 676), Área: 58725 px²
+- cup: 0.769 (prioridad: medium)
+  Bbox: (793, 465, 987, 705), Área: 46560 px²
+
